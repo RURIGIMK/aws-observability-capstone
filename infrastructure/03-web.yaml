@@ -1,0 +1,131 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Duka observability capstone - web tier. Two Amazon Linux 2023 instances running Apache behind
+  the ALB (one per AZ). The CloudWatch Agent ships memory, disk, CPU and swap metrics plus the
+  Apache access and error logs, using the agent configuration stored in SSM Parameter Store.
+
+Parameters:
+  Project:
+    Type: String
+    Default: duka
+  InstanceType:
+    Type: String
+    Default: t3.micro
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+  AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/${Project}/web/httpd-access', RetentionInDays: 7 }
+  ErrorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/${Project}/web/httpd-error', RetentionInDays: 7 }
+
+  # One agent config for every web instance; change it here, then re-run fetch-config.
+  AgentConfig:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${Project}/cloudwatch-agent/web'
+      Type: String
+      Value: !Sub |
+        {
+          "agent": { "metrics_collection_interval": 60, "run_as_user": "root" },
+          "metrics": {
+            "namespace": "CWAgent",
+            "append_dimensions": { "AutoScalingGroupName": "${!aws:AutoScalingGroupName}", "InstanceId": "${!aws:InstanceId}" },
+            "aggregation_dimensions": [["AutoScalingGroupName"]],
+            "metrics_collected": {
+              "cpu":  { "measurement": ["cpu_usage_user", "cpu_usage_system", "cpu_usage_iowait"], "totalcpu": true },
+              "mem":  { "measurement": ["mem_used_percent"] },
+              "disk": { "measurement": ["used_percent"], "resources": ["/"] },
+              "swap": { "measurement": ["swap_used_percent"] }
+            }
+          },
+          "logs": {
+            "logs_collected": {
+              "files": {
+                "collect_list": [
+                  { "file_path": "/var/log/httpd/access_log", "log_group_name": "/${Project}/web/httpd-access",
+                    "log_stream_name": "{instance_id}", "timezone": "UTC" },
+                  { "file_path": "/var/log/httpd/error_log",  "log_group_name": "/${Project}/web/httpd-error",
+                    "log_stream_name": "{instance_id}", "timezone": "UTC" }
+                ]
+              }
+            }
+          }
+        }
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: { Roles: [!Ref InstanceRole] }
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${Project}-web'
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
+        SecurityGroupIds: [{ 'Fn::ImportValue': !Sub '${Project}-WebSG' }]
+        MetadataOptions: { HttpTokens: required }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{ Key: Name, Value: !Sub '${Project}-web' }, { Key: Tier, Value: web }]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+            dnf install -y httpd amazon-cloudwatch-agent
+            # LogFormat with response time (%D, microseconds) so latency is visible in the access log
+            sed -i 's|LogFormat "%h %l %u %t \\"%r\\" %>s %b \\"%{Referer}i\\" \\"%{User-Agent}i\\"" combined|LogFormat "%{X-Forwarded-For}i %l %u %t \\"%r\\" %>s %b \\"%{Referer}i\\" \\"%{User-Agent}i\\" %D" combined|' /etc/httpd/conf/httpd.conf
+            TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
+            IID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+            AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            echo ok > /var/www/html/health.html
+            cat > /var/www/html/index.html <<HTML
+            <!doctype html><html><head><meta charset="utf-8"><title>Duka</title>
+            <style>body{font-family:system-ui,sans-serif;max-width:760px;margin:2.5rem auto;padding:0 1rem;color:#222}
+            pre{background:#f4f4f4;padding:1rem;border-radius:6px;overflow:auto}</style></head><body>
+            <h1>Duka &mdash; orders dashboard</h1>
+            <p>Web tier: <b>$IID</b> in <b>$AZ</b>. Data below comes from the ECS API tier, which reads RDS MySQL.</p>
+            <h3>Revenue by county</h3><pre id="r">loading&hellip;</pre>
+            <script>fetch('/api/report').then(r=>r.json()).then(d=>{document.getElementById('r').textContent=JSON.stringify(d.counties,null,2)}).catch(e=>{document.getElementById('r').textContent='API error: '+e})</script>
+            </body></html>
+            HTML
+            systemctl enable --now httpd
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s \
+              -c ssm:/${Project}/cloudwatch-agent/web
+
+  WebAsg:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: [AccessLogGroup, ErrorLogGroup, AgentConfig]
+    Properties:
+      AutoScalingGroupName: !Sub '${Project}-web-asg'
+      MinSize: '2'
+      MaxSize: '2'
+      DesiredCapacity: '2'
+      VPCZoneIdentifier: !Split [',', { 'Fn::ImportValue': !Sub '${Project}-PublicSubnets' }]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      TargetGroupARNs: [{ 'Fn::ImportValue': !Sub '${Project}-WebTG' }]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 120
+      MetricsCollection: [{ Granularity: 1Minute }]
+
+Outputs:
+  WebAsgName:
+    Value: !Ref WebAsg
+    Export: { Name: !Sub '${Project}-WebAsg' }

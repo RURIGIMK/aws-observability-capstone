@@ -1,0 +1,259 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Duka observability capstone - foundation. VPC across two AZs, security groups, the public
+  Application Load Balancer that fronts both the web tier (EC2) and the API (ECS, /api/*),
+  ECR repository plus a CodeBuild job that builds the API image from the public GitHub repo,
+  and the S3 bucket that receives the long-term log archive from Kinesis Data Firehose.
+
+Parameters:
+  Project:
+    Type: String
+    Default: duka
+  RepositoryUrl:
+    Type: String
+    Description: Public GitHub repo holding app/ (cloned anonymously by CodeBuild)
+  VpcCidr:
+    Type: String
+    Default: 10.30.0.0/16
+
+Resources:
+  # ---------------------------------------------------------------- network
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{ Key: Name, Value: !Sub '${Project}-vpc' }]
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref VPC, InternetGatewayId: !Ref InternetGateway }
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 8]]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub '${Project}-public-a' }]
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 8]]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub '${Project}-public-b' }]
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 4, 8]]
+      Tags: [{ Key: Name, Value: !Sub '${Project}-private-a' }]
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 4, 8]]
+      Tags: [{ Key: Name, Value: !Sub '${Project}-private-b' }]
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VPC }
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable }
+  PublicAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable }
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VPC }
+  PrivateAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetA, RouteTableId: !Ref PrivateRouteTable }
+  PrivateAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRouteTable }
+
+  # ---------------------------------------------------------------- security groups
+  AlbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public HTTP to the ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress: [{ IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }]
+  WebSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web tier - HTTP from the ALB only
+      VpcId: !Ref VPC
+      SecurityGroupIngress: [{ IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref AlbSG }]
+  AppSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App tier - API port from the ALB only
+      VpcId: !Ref VPC
+      SecurityGroupIngress: [{ IpProtocol: tcp, FromPort: 8080, ToPort: 8080, SourceSecurityGroupId: !Ref AlbSG }]
+  DbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Data tier - MySQL from the app tier only
+      VpcId: !Ref VPC
+      SecurityGroupIngress: [{ IpProtocol: tcp, FromPort: 3306, ToPort: 3306, SourceSecurityGroupId: !Ref AppSG }]
+
+  # ---------------------------------------------------------------- load balancer
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${Project}-alb'
+      Scheme: internet-facing
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref AlbSG]
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${Project}-web-tg'
+      VpcId: !Ref VPC
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckPath: /health.html
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${Project}-app-tg'
+      VpcId: !Ref VPC
+      Protocol: HTTP
+      Port: 8080
+      TargetType: ip
+      HealthCheckPath: /api/health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      TargetGroupAttributes: [{ Key: deregistration_delay.timeout_seconds, Value: '10' }]
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref WebTargetGroup }]
+  ApiRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref Listener
+      Priority: 10
+      Conditions: [{ Field: path-pattern, Values: ['/api/*'] }]
+      Actions: [{ Type: forward, TargetGroupArn: !Ref AppTargetGroup }]
+
+  # ---------------------------------------------------------------- image build
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${Project}-api'
+      EmptyOnDelete: true
+      ImageScanningConfiguration: { ScanOnPush: true }
+  BuilderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: codebuild.amazonaws.com }, Action: sts:AssumeRole }]
+      Policies:
+        - PolicyName: build
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: '*'
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability, ecr:InitiateLayerUpload, ecr:UploadLayerPart,
+                         ecr:CompleteLayerUpload, ecr:PutImage, ecr:BatchGetImage]
+                Resource: !GetAtt Repository.Arn
+  Builder:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${Project}-api-build'
+      ServiceRole: !GetAtt BuilderRole.Arn
+      TimeoutInMinutes: 15
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            build:
+              commands:
+                - git clone --depth 1 "$REPO_URL" src
+                - TAG=$(git -C src rev-parse --short HEAD)
+                - aws ecr get-login-password | docker login --username AWS --password-stdin "${IMAGE_URI%%/*}"
+                - docker build --build-arg APP_VERSION="$TAG" -t "$IMAGE_URI:$TAG" -t "$IMAGE_URI:latest" src/app
+                - docker push "$IMAGE_URI:$TAG"
+                - docker push "$IMAGE_URI:latest"
+      Artifacts: { Type: NO_ARTIFACTS }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - { Name: REPO_URL, Value: !Ref RepositoryUrl }
+          - { Name: IMAGE_URI, Value: !GetAtt Repository.RepositoryUri }
+      LogsConfig:
+        CloudWatchLogs: { Status: ENABLED, GroupName: !Sub '/codebuild/${Project}-api-build' }
+
+  # ---------------------------------------------------------------- log archive
+  LogArchiveBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${Project}-log-archive-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration: [{ ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 } }]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          # Hot in CloudWatch for 7 days, then cheap long-term retention in S3 for audit
+          - Id: tier-and-expire
+            Status: Enabled
+            Transitions: [{ StorageClass: STANDARD_IA, TransitionInDays: 30 }, { StorageClass: GLACIER_IR, TransitionInDays: 90 }]
+            ExpirationInDays: 400
+
+Outputs:
+  VpcId: { Value: !Ref VPC, Export: { Name: !Sub '${Project}-VpcId' } }
+  PublicSubnets:
+    Value: !Join [',', [!Ref PublicSubnetA, !Ref PublicSubnetB]]
+    Export: { Name: !Sub '${Project}-PublicSubnets' }
+  PrivateSubnets:
+    Value: !Join [',', [!Ref PrivateSubnetA, !Ref PrivateSubnetB]]
+    Export: { Name: !Sub '${Project}-PrivateSubnets' }
+  WebSG: { Value: !Ref WebSG, Export: { Name: !Sub '${Project}-WebSG' } }
+  AppSG: { Value: !Ref AppSG, Export: { Name: !Sub '${Project}-AppSG' } }
+  DbSG: { Value: !Ref DbSG, Export: { Name: !Sub '${Project}-DbSG' } }
+  WebTargetGroupArn: { Value: !Ref WebTargetGroup, Export: { Name: !Sub '${Project}-WebTG' } }
+  AppTargetGroupArn: { Value: !Ref AppTargetGroup, Export: { Name: !Sub '${Project}-AppTG' } }
+  LoadBalancerFullName: { Value: !GetAtt LoadBalancer.LoadBalancerFullName, Export: { Name: !Sub '${Project}-AlbFullName' } }
+  AppTargetGroupFullName: { Value: !GetAtt AppTargetGroup.TargetGroupFullName, Export: { Name: !Sub '${Project}-AppTgFullName' } }
+  WebTargetGroupFullName: { Value: !GetAtt WebTargetGroup.TargetGroupFullName, Export: { Name: !Sub '${Project}-WebTgFullName' } }
+  LoadBalancerDNS: { Value: !GetAtt LoadBalancer.DNSName, Export: { Name: !Sub '${Project}-AlbDNS' } }
+  RepositoryUri: { Value: !GetAtt Repository.RepositoryUri, Export: { Name: !Sub '${Project}-RepoUri' } }
+  LogArchiveBucketArn: { Value: !GetAtt LogArchiveBucket.Arn, Export: { Name: !Sub '${Project}-LogArchiveArn' } }
+  LogArchiveBucketName: { Value: !Ref LogArchiveBucket, Export: { Name: !Sub '${Project}-LogArchiveName' } }

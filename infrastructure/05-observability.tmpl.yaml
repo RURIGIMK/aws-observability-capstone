@@ -1,0 +1,502 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Duka observability capstone - observability layer. Firehose log archive to S3 (subscription
+  filters on web, app and database log groups), ErrorCount metric filter, the three required
+  alarms plus RDS CPU, SNS on-call topic, EventBridge rules wired to a remediation Lambda,
+  a saved Logs Insights query and the operations dashboard.
+  GENERATED from 05-observability.tmpl.yaml + lambda/remediation/handler.py by scripts/render.py.
+
+Parameters:
+  Project:
+    Type: String
+    Default: duka
+  OnCallEmail:
+    Type: String
+    Description: Address subscribed to the on-call SNS topic (must confirm the subscription email)
+
+Resources:
+  # ================================================================ log archive (Firehose -> S3)
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: firehose.amazonaws.com }, Action: sts:AssumeRole }]
+      Policies:
+        - PolicyName: write-archive
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:AbortMultipartUpload, s3:GetBucketLocation, s3:GetObject, s3:ListBucket,
+                         s3:ListBucketMultipartUploads, s3:PutObject]
+                Resource:
+                  - { 'Fn::ImportValue': !Sub '${Project}-LogArchiveArn' }
+                  - !Sub ['${Arn}/*', { Arn: { 'Fn::ImportValue': !Sub '${Project}-LogArchiveArn' } }]
+              - Effect: Allow
+                Action: logs:PutLogEvents
+                Resource: '*'
+  FirehoseErrorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/aws/kinesisfirehose/${Project}-log-archive', RetentionInDays: 3 }
+  FirehoseErrorLogStream:
+    Type: AWS::Logs::LogStream
+    Properties: { LogGroupName: !Ref FirehoseErrorLogGroup, LogStreamName: S3Delivery }
+  LogArchiveStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub '${Project}-log-archive'
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN: { 'Fn::ImportValue': !Sub '${Project}-LogArchiveArn' }
+        RoleARN: !GetAtt FirehoseRole.Arn
+        # Partitioned by date so Athena/Glue can query the archive cheaply later
+        Prefix: 'logs/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/'
+        ErrorOutputPrefix: 'errors/!{firehose:error-output-type}/!{timestamp:yyyy-MM-dd}/'
+        BufferingHints: { IntervalInSeconds: 60, SizeInMBs: 1 }
+        CompressionFormat: GZIP
+        # CloudWatch Logs delivers gzip-compressed batches with control messages; unpack them so the
+        # archive holds plain log events, one per line.
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Decompression
+              Parameters: [{ ParameterName: CompressionFormat, ParameterValue: GZIP }]
+            - Type: CloudWatchLogProcessing
+              Parameters: [{ ParameterName: DataMessageExtraction, ParameterValue: 'true' }]
+            - Type: AppendDelimiterToRecord
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref FirehoseErrorLogGroup
+          LogStreamName: !Ref FirehoseErrorLogStream
+
+  LogsToFirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: logs.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition: { StringLike: { 'aws:SourceArn': !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*' } }
+      Policies:
+        - PolicyName: put-to-firehose
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [firehose:PutRecord, firehose:PutRecordBatch]
+                Resource: !GetAtt LogArchiveStream.Arn
+
+  ArchiveAppLogs:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      LogGroupName: !Sub '/${Project}/app'
+      FilterPattern: ''
+      DestinationArn: !GetAtt LogArchiveStream.Arn
+      RoleArn: !GetAtt LogsToFirehoseRole.Arn
+  ArchiveWebAccessLogs:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      LogGroupName: !Sub '/${Project}/web/httpd-access'
+      FilterPattern: ''
+      DestinationArn: !GetAtt LogArchiveStream.Arn
+      RoleArn: !GetAtt LogsToFirehoseRole.Arn
+  ArchiveWebErrorLogs:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      LogGroupName: !Sub '/${Project}/web/httpd-error'
+      FilterPattern: ''
+      DestinationArn: !GetAtt LogArchiveStream.Arn
+      RoleArn: !GetAtt LogsToFirehoseRole.Arn
+  ArchiveDbSlowQueryLogs:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      LogGroupName: !Sub '/aws/rds/instance/${Project}-db/slowquery'
+      FilterPattern: ''
+      DestinationArn: !GetAtt LogArchiveStream.Arn
+      RoleArn: !GetAtt LogsToFirehoseRole.Arn
+  ArchiveDbErrorLogs:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      LogGroupName: !Sub '/aws/rds/instance/${Project}-db/error'
+      FilterPattern: ''
+      DestinationArn: !GetAtt LogArchiveStream.Arn
+      RoleArn: !GetAtt LogsToFirehoseRole.Arn
+
+  # ================================================================ custom metrics from logs
+  ErrorCountMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Sub '/${Project}/app'
+      FilterName: app-error-count
+      FilterPattern: '{ $.level = "ERROR" }'
+      MetricTransformations:
+        - MetricNamespace: Duka/App
+          MetricName: ErrorCount
+          MetricValue: '1'
+          DefaultValue: 0
+          Unit: Count
+  SlowRequestMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Sub '/${Project}/app'
+      FilterName: app-slow-requests
+      FilterPattern: '{ $.latency_ms > 1000 }'
+      MetricTransformations:
+        - MetricNamespace: Duka/App
+          MetricName: SlowRequestCount
+          MetricValue: '1'
+          DefaultValue: 0
+          Unit: Count
+  DbSlowQueryMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Sub '/aws/rds/instance/${Project}-db/slowquery'
+      FilterName: db-slow-queries
+      FilterPattern: '"# Query_time"'
+      MetricTransformations:
+        - MetricNamespace: Duka/Database
+          MetricName: SlowQueryCount
+          MetricValue: '1'
+          DefaultValue: 0
+          Unit: Count
+
+  # ================================================================ saved Logs Insights queries
+  ErrorSpikeQuery:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub '${Project}/error-spikes'
+      LogGroupNames: [!Sub '/${Project}/app']
+      QueryString: |
+        fields @timestamp, level, path, status, message
+        | filter level = "ERROR"
+        | stats count(*) as errors by bin(1m) as minute, path
+        | sort minute desc
+  ErrorRateQuery:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub '${Project}/error-rate-and-latency-per-minute'
+      LogGroupNames: [!Sub '/${Project}/app']
+      QueryString: |
+        filter message = "request"
+        | stats count(*) as requests,
+                sum(status >= 500) as errors_5xx,
+                100 * sum(status >= 500) / count(*) as error_pct,
+                pct(latency_ms, 95) as p95_ms
+          by bin(1m) as minute
+        | sort minute desc
+  SlowQueryCorrelationQuery:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub '${Project}/db-slow-queries'
+      LogGroupNames: [!Sub '/aws/rds/instance/${Project}-db/slowquery']
+      QueryString: |
+        parse @message "# Query_time: * " as query_time_s
+        | parse @message /(?<statement>SELECT[^;]*)/
+        | filter ispresent(query_time_s)
+        | stats count(*) as slow_queries, max(query_time_s) as worst_s by bin(1m) as minute, statement
+        | sort minute desc
+
+  # ================================================================ on-call notifications
+  OnCallTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${Project}-oncall'
+      DisplayName: Duka On-Call
+      Subscription: [{ Protocol: email, Endpoint: !Ref OnCallEmail }]
+  OnCallTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref OnCallTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridge
+            Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref OnCallTopic
+
+  # ================================================================ alarms
+  EcsCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Project}-ecs-cpu-high'
+      AlarmDescription: ECS API tasks above 80% CPU -> Lambda forces a rolling task replacement and pages on-call
+      Namespace: AWS/ECS
+      MetricName: CPUUtilization
+      Dimensions:
+        - { Name: ClusterName, Value: { 'Fn::ImportValue': !Sub '${Project}-Cluster' } }
+        - { Name: ServiceName, Value: { 'Fn::ImportValue': !Sub '${Project}-Service' } }
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+  Alb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Project}-alb-5xx-high'
+      AlarmDescription: More than 5% of ALB requests returned 5xx -> tag web instances for investigation, restart API, page on-call
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: target5xx
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 60
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: HTTPCode_Target_5XX_Count
+              Dimensions: [{ Name: LoadBalancer, Value: { 'Fn::ImportValue': !Sub '${Project}-AlbFullName' } }]
+        - Id: elb5xx
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 60
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: HTTPCode_ELB_5XX_Count
+              Dimensions: [{ Name: LoadBalancer, Value: { 'Fn::ImportValue': !Sub '${Project}-AlbFullName' } }]
+        - Id: requests
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 60
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: RequestCount
+              Dimensions: [{ Name: LoadBalancer, Value: { 'Fn::ImportValue': !Sub '${Project}-AlbFullName' } }]
+        - Id: pct5xx
+          Label: ALB 5xx %
+          Expression: 100 * (FILL(target5xx, 0) + FILL(elb5xx, 0)) / IF(FILL(requests, 0) > 0, requests, 1)
+          ReturnData: true
+  ErrorCountAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Project}-app-error-spike'
+      AlarmDescription: More than 10 application ERROR log lines in 5 minutes -> restart API, tag web tier, page on-call
+      Namespace: Duka/App
+      MetricName: ErrorCount
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+  RdsCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Project}-rds-cpu-high'
+      AlarmDescription: Database CPU above 80% (notify only - never auto-restart a database)
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions: [{ Name: DBInstanceIdentifier, Value: { 'Fn::ImportValue': !Sub '${Project}-DBInstanceId' } }]
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # ================================================================ automated response
+  RemediationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
+      Policies:
+        - PolicyName: remediate
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ecs:UpdateService
+                Resource: !Sub
+                  - 'arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:service/${C}/${S}'
+                  - C: { 'Fn::ImportValue': !Sub '${Project}-Cluster' }
+                    S: { 'Fn::ImportValue': !Sub '${Project}-Service' }
+              - Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: '*'
+              - Effect: Allow
+                Action: ec2:CreateTags
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+                Condition: { StringEquals: { 'aws:ResourceTag/Tier': web } }
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref OnCallTopic
+  RemediationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/aws/lambda/${Project}-remediation', RetentionInDays: 7 }
+  RemediationFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: RemediationLogGroup
+    Properties:
+      FunctionName: !Sub '${Project}-remediation'
+      Description: Automated incident response for Duka alarms
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 128
+      Role: !GetAtt RemediationRole.Arn
+      TracingConfig: { Mode: Active }
+      Environment:
+        Variables:
+          ECS_CLUSTER: { 'Fn::ImportValue': !Sub '${Project}-Cluster' }
+          ECS_SERVICE: { 'Fn::ImportValue': !Sub '${Project}-Service' }
+          SNS_TOPIC_ARN: !Ref OnCallTopic
+          WEB_TIER_TAG_KEY: Tier
+          WEB_TIER_TAG_VALUE: web
+      Code:
+        ZipFile: |
+__LAMBDA_CODE__
+
+  AlarmStateRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${Project}-alarm-to-remediation'
+      Description: Any Duka alarm entering ALARM triggers the remediation Lambda
+      EventPattern:
+        source: [aws.cloudwatch]
+        detail-type: [CloudWatch Alarm State Change]
+        detail:
+          alarmName: [{ prefix: !Sub '${Project}-' }]
+          state: { value: [ALARM] }
+      Targets:
+        - Id: remediation
+          Arn: !GetAtt RemediationFunction.Arn
+          RetryPolicy: { MaximumRetryAttempts: 2, MaximumEventAgeInSeconds: 600 }
+  AlarmRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RemediationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AlarmStateRule.Arn
+
+  # Second, independent signal: tasks that die on their own (OOM, crash) page on-call directly.
+  TaskStoppedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${Project}-ecs-task-stopped'
+      Description: Notify on-call when an API task stops unexpectedly (not during deployments)
+      EventPattern:
+        source: [aws.ecs]
+        detail-type: [ECS Task State Change]
+        detail:
+          clusterArn: [{ wildcard: !Sub ['*/${C}', { C: { 'Fn::ImportValue': !Sub '${Project}-Cluster' } }] }]
+          lastStatus: [STOPPED]
+          stopCode: [EssentialContainerExited, TaskFailedToStart]
+      Targets:
+        - Id: oncall
+          Arn: !Ref OnCallTopic
+          InputTransformer:
+            InputPathsMap: { task: '$.detail.taskArn', reason: '$.detail.stoppedReason', code: '$.detail.stopCode' }
+            InputTemplate: '"Duka API task <task> stopped (<code>): <reason>"'
+
+  # ================================================================ dashboard
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${Project}-observability'
+      DashboardBody: !Sub
+        - |
+          {
+            "start": "-PT3H",
+            "periodOverride": "inherit",
+            "widgets": [
+              { "type": "text", "x": 0, "y": 0, "width": 24, "height": 2,
+                "properties": { "markdown": "# Duka - multi-tier observability\nWeb (EC2 + Apache) -> API (ECS Fargate + X-Ray) -> RDS MySQL. Alarms trigger EventBridge -> Lambda remediation -> SNS on-call. Saved queries: **${Project}/error-spikes**, **${Project}/error-rate-and-latency-per-minute**, **${Project}/db-slow-queries**." } },
+              { "type": "alarm", "x": 0, "y": 2, "width": 24, "height": 3,
+                "properties": { "title": "Alarm overview",
+                  "alarms": [ "${EcsCpuAlarm.Arn}", "${Alb5xxAlarm.Arn}", "${ErrorCountAlarm.Arn}", "${RdsCpuAlarm.Arn}" ] } },
+              { "type": "metric", "x": 0, "y": 5, "width": 8, "height": 6,
+                "properties": { "title": "ALB: requests and 5xx", "region": "${AWS::Region}", "view": "timeSeries", "period": 60,
+                  "metrics": [
+                    [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${Alb}", { "stat": "Sum", "label": "Requests" } ],
+                    [ ".", "HTTPCode_Target_5XX_Count", ".", ".", { "stat": "Sum", "label": "Target 5xx", "color": "#d62728" } ],
+                    [ ".", "HTTPCode_ELB_5XX_Count", ".", ".", { "stat": "Sum", "label": "ALB 5xx", "color": "#ff9896" } ]
+                  ] } },
+              { "type": "metric", "x": 8, "y": 5, "width": 8, "height": 6,
+                "properties": { "title": "ALB: 5xx % (alarm at 5%)", "region": "${AWS::Region}", "view": "timeSeries", "period": 60,
+                  "metrics": [
+                    [ { "expression": "100*(FILL(m1,0)+FILL(m2,0))/IF(FILL(m3,0)>0,m3,1)", "label": "5xx %", "id": "e1", "color": "#d62728" } ],
+                    [ "AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "LoadBalancer", "${Alb}", { "stat": "Sum", "id": "m1", "visible": false } ],
+                    [ ".", "HTTPCode_ELB_5XX_Count", ".", ".", { "stat": "Sum", "id": "m2", "visible": false } ],
+                    [ ".", "RequestCount", ".", ".", { "stat": "Sum", "id": "m3", "visible": false } ]
+                  ],
+                  "annotations": { "horizontal": [ { "label": "alarm", "value": 5 } ] }, "yAxis": { "left": { "min": 0 } } } },
+              { "type": "metric", "x": 16, "y": 5, "width": 8, "height": 6,
+                "properties": { "title": "Latency p95 (s): web vs API", "region": "${AWS::Region}", "view": "timeSeries", "period": 60,
+                  "metrics": [
+                    [ "AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${Alb}", "TargetGroup", "${AppTg}", { "stat": "p95", "label": "API (ECS) p95" } ],
+                    [ "...", "${WebTg}", { "stat": "p95", "label": "Web (EC2) p95" } ]
+                  ] } },
+              { "type": "metric", "x": 0, "y": 11, "width": 8, "height": 6,
+                "properties": { "title": "ECS API: CPU / memory % (alarm at 80% CPU)", "region": "${AWS::Region}", "view": "timeSeries", "period": 60,
+                  "metrics": [
+                    [ "AWS/ECS", "CPUUtilization", "ClusterName", "${Cluster}", "ServiceName", "${Service}", { "stat": "Average", "label": "CPU %" } ],
+                    [ ".", "MemoryUtilization", ".", ".", ".", ".", { "stat": "Average", "label": "Memory %" } ],
+                    [ "ECS/ContainerInsights", "RunningTaskCount", ".", ".", ".", ".", { "stat": "Average", "label": "Running tasks", "yAxis": "right" } ]
+                  ],
+                  "annotations": { "horizontal": [ { "label": "CPU alarm", "value": 80 } ] }, "yAxis": { "left": { "min": 0, "max": 100 } } } },
+              { "type": "metric", "x": 8, "y": 11, "width": 8, "height": 6,
+                "properties": { "title": "App: ErrorCount (log metric) and slow requests", "region": "${AWS::Region}", "view": "timeSeries", "period": 60,
+                  "metrics": [
+                    [ "Duka/App", "ErrorCount", { "stat": "Sum", "label": "ERROR log lines", "color": "#d62728" } ],
+                    [ ".", "SlowRequestCount", { "stat": "Sum", "label": "Requests > 1 s" } ],
+                    [ "Duka/Database", "SlowQueryCount", { "stat": "Sum", "label": "DB slow queries (> 1 s)", "color": "#9467bd" } ]
+                  ] } },
+              { "type": "metric", "x": 16, "y": 11, "width": 8, "height": 6,
+                "properties": { "title": "Web EC2 (CloudWatch Agent): memory / disk / CPU %", "region": "${AWS::Region}", "view": "timeSeries", "period": 60,
+                  "metrics": [
+                    [ "CWAgent", "mem_used_percent", "AutoScalingGroupName", "${WebAsg}", { "stat": "Average", "label": "Memory %" } ],
+                    [ ".", "disk_used_percent", ".", ".", { "stat": "Average", "label": "Disk / %" } ],
+                    [ "AWS/EC2", "CPUUtilization", ".", ".", { "stat": "Average", "label": "CPU %" } ]
+                  ], "yAxis": { "left": { "min": 0, "max": 100 } } } },
+              { "type": "metric", "x": 0, "y": 17, "width": 8, "height": 6,
+                "properties": { "title": "RDS: connections and CPU", "region": "${AWS::Region}", "view": "timeSeries", "period": 60,
+                  "metrics": [
+                    [ "AWS/RDS", "DatabaseConnections", "DBInstanceIdentifier", "${Db}", { "stat": "Average", "label": "Connections" } ],
+                    [ ".", "CPUUtilization", ".", ".", { "stat": "Average", "label": "CPU %", "yAxis": "right" } ]
+                  ] } },
+              { "type": "metric", "x": 8, "y": 17, "width": 8, "height": 6,
+                "properties": { "title": "RDS: read / write latency (ms)", "region": "${AWS::Region}", "view": "timeSeries", "period": 60,
+                  "metrics": [
+                    [ { "expression": "m1*1000", "label": "Read latency ms", "id": "e1" } ],
+                    [ { "expression": "m2*1000", "label": "Write latency ms", "id": "e2" } ],
+                    [ "AWS/RDS", "ReadLatency", "DBInstanceIdentifier", "${Db}", { "id": "m1", "visible": false } ],
+                    [ ".", "WriteLatency", ".", ".", { "id": "m2", "visible": false } ]
+                  ] } },
+              { "type": "log", "x": 16, "y": 17, "width": 8, "height": 6,
+                "properties": { "title": "Logs Insights: errors per minute by path", "region": "${AWS::Region}", "view": "table",
+                  "query": "SOURCE '/${Project}/app' | fields @timestamp, path | filter level = \"ERROR\" | stats count(*) as errors by bin(1m) as minute, path | sort minute desc | limit 20" } }
+            ]
+          }
+        - Alb: { 'Fn::ImportValue': !Sub '${Project}-AlbFullName' }
+          AppTg: { 'Fn::ImportValue': !Sub '${Project}-AppTgFullName' }
+          WebTg: { 'Fn::ImportValue': !Sub '${Project}-WebTgFullName' }
+          Cluster: { 'Fn::ImportValue': !Sub '${Project}-Cluster' }
+          Service: { 'Fn::ImportValue': !Sub '${Project}-Service' }
+          Db: { 'Fn::ImportValue': !Sub '${Project}-DBInstanceId' }
+          WebAsg: { 'Fn::ImportValue': !Sub '${Project}-WebAsg' }
+
+Outputs:
+  DashboardUrl:
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${Project}-observability'
+  OnCallTopicArn:
+    Value: !Ref OnCallTopic
+  RemediationFunction:
+    Value: !Ref RemediationFunction
+  FirehoseStream:
+    Value: !Ref LogArchiveStream

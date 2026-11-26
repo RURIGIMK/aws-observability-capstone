@@ -1,0 +1,105 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Duka observability capstone - data tier. RDS for MySQL with Enhanced Monitoring (OS metrics
+  every 15 s), Performance Insights (per-query DB load) and the error + slow query logs exported
+  to CloudWatch Logs. The slow query log captures any statement over 1 s.
+
+Parameters:
+  Project:
+    Type: String
+    Default: duka
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    Description: db.t3.micro keeps the lab cheap. Use db.t3.medium or larger to get Performance Insights.
+
+Conditions:
+  PerformanceInsightsSupported: !Not
+    - !Or
+      - !Equals [!Ref DBInstanceClass, db.t3.micro]
+      - !Equals [!Ref DBInstanceClass, db.t3.small]
+      - !Equals [!Ref DBInstanceClass, db.t4g.micro]
+      - !Equals [!Ref DBInstanceClass, db.t4g.small]
+
+Resources:
+  # Created up front so they exist (with retention) before RDS starts exporting, and so the
+  # observability stack can attach Firehose subscription filters to them immediately.
+  ErrorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/rds/instance/${Project}-db/error'
+      RetentionInDays: 7
+  SlowQueryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/rds/instance/${Project}-db/slowquery'
+      RetentionInDays: 7
+
+  ParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: Slow query logging for observability
+      Family: mysql8.4
+      Parameters:
+        slow_query_log: '1'
+        long_query_time: '1'
+        log_output: FILE
+        performance_schema: '1'
+
+  SubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets in two AZs
+      SubnetIds: !Split [',', { 'Fn::ImportValue': !Sub '${Project}-PrivateSubnets' }]
+
+  MonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: monitoring.rds.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole]
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DependsOn: [ErrorLogGroup, SlowQueryLogGroup]
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub '${Project}-db'
+      Engine: mysql
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: '20'
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: duka
+      MasterUsername: dukaadmin
+      ManageMasterUserPassword: true
+      DBParameterGroupName: !Ref ParameterGroup
+      DBSubnetGroupName: !Ref SubnetGroup
+      VPCSecurityGroups: [{ 'Fn::ImportValue': !Sub '${Project}-DbSG' }]
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 0
+      DeleteAutomatedBackups: true
+      DeletionProtection: false
+      # --- observability
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt MonitoringRole.Arn
+      EnablePerformanceInsights: !If [PerformanceInsightsSupported, true, false]
+      PerformanceInsightsRetentionPeriod: !If [PerformanceInsightsSupported, 7, !Ref 'AWS::NoValue']
+      EnableCloudwatchLogsExports: [error, slowquery]
+
+Outputs:
+  DBEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+    Export: { Name: !Sub '${Project}-DBEndpoint' }
+  DBSecretArn:
+    Value: !GetAtt Database.MasterUserSecret.SecretArn
+    Export: { Name: !Sub '${Project}-DBSecretArn' }
+  DBInstanceId:
+    Value: !Ref Database
+    Export: { Name: !Sub '${Project}-DBInstanceId' }
+  DBResourceId:
+    Value: !GetAtt Database.DbiResourceId
+    Export: { Name: !Sub '${Project}-DBResourceId' }
