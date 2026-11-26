@@ -22,8 +22,8 @@ build_image() {
 }
 
 case "${1:-}" in
-  up)
-    EMAIL=${2:?usage: up <oncall-email>}
+  up|base)
+    [ "$1" = up ] && EMAIL=${2:?usage: up <oncall-email>}
     deploy "$P-foundation" infrastructure/01-foundation.yaml --parameter-overrides Project="$P" RepositoryUrl="$REPO_URL"
     deploy "$P-data" infrastructure/02-data.yaml --parameter-overrides Project="$P" & DATA=$!
     build_image & BUILD=$!
@@ -32,6 +32,10 @@ case "${1:-}" in
     wait $DATA
     deploy "$P-app" infrastructure/04-app.yaml --parameter-overrides Project="$P"
     wait $WEB
+    [ "$1" = base ] && { echo "base tiers ready; run: $0 observability <email>"; exit 0; }
+    "$0" observability "$EMAIL" ;;
+  observability)
+    EMAIL=${2:?usage: observability <oncall-email>}
     python3 scripts/render.py
     deploy "$P-observability" infrastructure/05-observability.yaml --parameter-overrides Project="$P" OnCallEmail="$EMAIL"
     echo "App: http://$(out "$P-foundation" LoadBalancerDNS)/"
@@ -66,5 +70,5 @@ case "${1:-}" in
     aws cloudwatch describe-alarms --alarm-name-prefix "$P-" --query 'MetricAlarms[].AlarmName' --output text
     aws ec2 describe-addresses --query 'Addresses[].PublicIp' --output text
     echo "--- end" ;;
-  *) echo "usage: $0 up <email> | down | verify"; exit 1 ;;
+  *) echo "usage: $0 up <email> | base | observability <email> | down | verify"; exit 1 ;;
 esac
