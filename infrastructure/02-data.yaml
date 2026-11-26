@@ -1,8 +1,9 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   Duka observability capstone - data tier. RDS for MySQL with Enhanced Monitoring (OS metrics
-  every 15 s), Performance Insights (per-query DB load) and the error + slow query logs exported
-  to CloudWatch Logs. The slow query log captures any statement over 1 s.
+  every 60 s) and the error + slow query logs exported to CloudWatch Logs. The slow query log
+  captures any statement over 1 s. Performance Insights is enabled automatically on instance
+  classes that support it (MySQL does not support it on micro/small classes).
 
 Parameters:
   Project:

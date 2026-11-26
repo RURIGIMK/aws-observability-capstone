@@ -81,6 +81,8 @@ def init_schema():
         try:
             conn = db()
             with conn.cursor() as cur:
+                # Serialise initialisation across workers and tasks
+                cur.execute("SELECT GET_LOCK('duka_schema_init', 60)")
                 cur.execute(
                     """CREATE TABLE IF NOT EXISTS orders (
                          id VARCHAR(36) PRIMARY KEY,
@@ -101,6 +103,7 @@ def init_schema():
                     cur.executemany(
                         "INSERT INTO orders (id, customer, county, amount_kes) VALUES (%s,%s,%s,%s)", rows
                     )
+                cur.execute("SELECT RELEASE_LOCK('duka_schema_init')")
             conn.close()
             event(logging.INFO, "schema ready")
             return
