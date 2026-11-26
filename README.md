@@ -74,6 +74,7 @@ flowchart LR
 | Dashboard: ALB 5xx %, latency, ECS CPU, ErrorCount during the incident window | ![](docs/img/12-dashboard-alb-ecs-incident.jpg) |
 | Dashboard: RDS CPU, latency, Logs Insights widget | ![](docs/img/13-dashboard-rds-insights.jpg) |
 | Unplanned real incident caught and auto-remediated | ![](docs/img/00-real-incident-caught.png) |
+| Teardown: all stacks deleted, verify finds nothing left | ![](docs/img/14-teardown-verified.png) |
 
 
 ## Repository layout
