@@ -5,6 +5,10 @@ Logs Insights can filter on fields), is traced end to end by AWS X-Ray (Flask + 
 auto-instrumented, so DB calls appear as subsegments), and has fault-injection endpoints used
 by the mock failure test.
 """
+# Pre-load the idna codec in the main thread. Without this, the first DNS/socket call made from a
+# gunicorn worker thread (PyMySQL connect, X-Ray UDP emit) can fail with
+# "LookupError: unknown encoding: idna" because of a lazy-import race in the codecs registry.
+import encodings.idna  # noqa: F401
 import json
 import logging
 import math
